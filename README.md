@@ -43,4 +43,4 @@ library(breastCancerNKI)
 
 (3) The METABRIC data need to be download from the EMBL-EBI repository (https://www.ebi.ac.uk/ega/, accession number EGAS00000000083, require individual access agreement).
 
-(4) Please install CancerSubtypesPrognosis package from https://github.com/XiaomeiLi1/CancerSubtypesPrognosis
+(4) Please install CancerSubtypesPrognosis package from https://github.com/XiaomeiLi1/CancerSubtypesPrognosis.
