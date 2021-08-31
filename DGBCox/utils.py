@@ -3,219 +3,140 @@ import numpy as np
 import pandas as pd
 from sksurv.util import Surv
 from sksurv.nonparametric import CensoringDistributionEstimator
+from lifelines.utils import concordance_index as ci
 
-class SimulatedData:
-    def __init__(self, hr_ratio,
-        average_death = 5,
-        censor_mode = 'end_time', end_time = 15, observed_p = None,
-        num_features = 10, num_var = 2,
-        treatment_group = False):
-        """
-        Factory class for producing simulated survival data.
-        Current supports two forms of simulated data:
-            Linear:
-                Where risk is a linear combination of an observation's features
-            Nonlinear (Gaussian):
-                A gaussian combination of covariates
-        Parameters:
-            hr_ratio: lambda_max hazard ratio.
-            average_death: average death time that is the mean of the
-                Exponentional distribution.
-            censor_mode: the method to calculate whether a patient is censored.
-                Options: ['end_time', 'observed_p']
-                'end_time': requires the parameter end_time, which is used to censor any patient with death_time > end_time
-                'observed_p': requires the parammeter observed_p, which is the percentage of patients with observed death times
-            end_time: censoring time that represents an 'end of study'. Any death
-                time greater than end_time will be censored.
-            num_features: size of observation vector. Default: 10.
-            num_var: number of varaibles simulated data depends on. Default: 2.
-            treatment_group: True or False. Include an additional covariate
-                representing a binary treatment group.
-        """
+def _check_config(config):
+    """
+    Check configuration and complete it with default_config.
+    Parameters
+    ----------
+    config: dict
+        Some configurations or hyper-parameters of neural network.
+    """
+    default_config = {
+        "learning_rate": 0.001,
+        "learning_rate_decay": 1.0,
+        "activation": "relu",
+        "L2_reg": 0.0,
+        "L1_reg": 0.0,
+        "optimizer": "rms",
+        "dropout_keep_prob": 1.0,
+        "seed": 68
+    }
+    for k in default_config.keys():
+        if k not in config:
+            config[k] = default_config[k]
 
-        self.hr_ratio = hr_ratio
-        self.censor_mode = censor_mode
-        self.end_time = end_time
-        self.observed_p = observed_p
-        self.average_death = average_death
-        self.treatment_group = treatment_group
-        self.m = int(num_features) + int(treatment_group)
-        self.num_var = num_var
+def _check_input_dimension(dim_nodes, dim_data):
+    """
+    Check the value of input_nodes and the dimension of data_X.
+    Parameters
+    ----------
+    dim_nodes: int
+        the value of input_nodes.
+    dim_data: int
+        the dimension of data_X.
+    """
+    if dim_nodes != dim_data:
+        raise ValueError("The value of input nodes must be equal to the number of features.")
 
-    def _linear_H(self,x):
-        """
-        Calculates a linear combination of x's features.
-        Coefficients are 1, 2, ..., self.num_var, 0,..0]
-        Parameters:
-            x: (n,m) numpy array of observations
-        Returns:
-            risk: the calculated linear risk for a set of data x
-        """
-        # Make the coefficients [1,2,...,num_var,0,..0]
-        b = np.zeros((self.m,))
-        b[0:self.num_var] = range(1,self.num_var + 1)
+def _check_surv_data(surv_data_X, surv_data_y):
+    """
+    Check survival data and raise errors.
+    Parameters
+    ----------
+    surv_data_X: DataFrame
+        Covariates of survival data.
+    surv_data_y: DataFrame
+        Labels of survival data. Negtive values are considered right censored.
+    """
+    if not isinstance(surv_data_X, pd.DataFrame):
+        raise TypeError("The type of X must DataFrame.")
+    if not isinstance(surv_data_y, pd.DataFrame) or len(surv_data_y.columns) != 1:
+        raise TypeError("The type of y must be DataFrame and contains only one column.")
 
-        # Linear Combinations of Coefficients and Covariates
-        risk = np.dot(x, b)
-        return risk
+def _prepare_surv_data(surv_data_X, surv_data_y):
+    """
+    Prepare the survival data. The surv_data will be sorted by abs(`surv_data_y`) DESC.
+    Parameters
+    ----------
+    surv_data_X: DataFrame
+        Covariates of survival data.
+    surv_data_y: DataFrame
+        Labels of survival data. Negtive values are considered right censored.
+    Returns
+    -------
+    tuple
+        sorted indices in `surv_data` and sorted DataFrame.
+    Notes
+    -----
+    For ensuring the correctness of breslow function computation, survival data
+    must be sorted by observed time (DESC).
+    """
+    _check_surv_data(surv_data_X, surv_data_y)
+    # sort by T DESC
+    T = - np.abs(np.squeeze(np.array(surv_data_y)))
+    sorted_idx = np.argsort(T)
+    return sorted_idx, surv_data_X.iloc[sorted_idx, :], surv_data_y.iloc[sorted_idx, :]
 
-    def _gaussian_H(self,x,
-        c= 0.0, rad= 0.5):
-        """
-        Calculates the Gaussian function of a subset of x's features.
-        Parameters:
-            x: (n, m) numpy array of observations.
-            c: offset of Gaussian function. Default: 0.0.
-            r: Gaussian scale parameter. Default: 0.5.
-        Returns:
-            risk: the calculated Gaussian risk for a set of data x
-        """
-        max_hr, min_hr = log(self.hr_ratio), log(1.0 / self.hr_ratio)
+def concordance_index(y_true, y_pred):
+    """
+    Compute the concordance-index value.
+    Parameters
+    ----------
+    y_true : np.array
+        Observed time. Negtive values are considered right censored.
+    y_pred : np.array
+        Predicted value.
+    Returns
+    -------
+    float
+        Concordance index.
+    """
+    y_true = np.squeeze(y_true)
+    y_pred = np.squeeze(y_pred)
+    t = np.abs(y_true)
+    e = (y_true > 0).astype(np.int32)
+    ci_value = ci(t, y_pred, e)
+    return ci_value
 
-        # Z = ( (x_0 - c)^2 + (x_1 - c)^2 + ... + (x_{num_var} - c)^2)
-        z = np.square((x - c))
-        z = np.sum(z[:,0:self.num_var], axis = -1)
+def _baseline_hazard(label_e, label_t, pred_hr):
+    ind_df = pd.DataFrame({"E": label_e, "T": label_t, "P": pred_hr})
+    summed_over_durations = ind_df.groupby("T")[["P", "E"]].sum()
+    summed_over_durations["P"] = summed_over_durations["P"].loc[::-1].cumsum()
+    # where the index of base_haz is sorted time from small to large
+    # and the column `base_haz` is baseline hazard rate
+    base_haz = pd.DataFrame(
+        summed_over_durations["E"] / summed_over_durations["P"], columns=["base_haz"]
+    )
+    return base_haz
 
-        # Compute Gaussian
-        risk = max_hr * (np.exp(-(z) / (2 * rad ** 2)))
-        return risk
+def _baseline_cumulative_hazard(label_e, label_t, pred_hr):
+    return _baseline_hazard(label_e, label_t, pred_hr).cumsum()
 
-    def generate_data(self, N,
-        method = 'gaussian', gaussian_config = {},
-        **kwargs):
-        """
-        Generates a set of observations according to an exponentional Cox model.
-        Parameters:
-            N: the number of observations.
-            method: the type of simulated data. 'linear' or 'gaussian'.
-            guassian_config: dictionary of additional parameters for gaussian
-                simulation.
-        Returns:
-            dataset: a dictionary object with the following keys:
-                'x' : (N,m) numpy array of observations.
-                't' : (N) numpy array of observed time events.
-                'e' : (N) numpy array of observed time intervals.
-                'hr': (N) numpy array of observed true risk.
-        See:
-        Peter C Austin. Generating survival times to simulate cox proportional
-        hazards models with time-varying covariates. Statistics in medicine,
-        31(29):3946-3958, 2012.
-        """
+def _baseline_survival_function(label_e, label_t, pred_hr):
+    base_cum_haz = _baseline_cumulative_hazard(label_e, label_t, pred_hr)
+    survival_df = np.exp(-base_cum_haz)
+    return survival_df
 
-        # Patient Baseline information
-        data = np.random.uniform(low= -1, high= 1,
-            size = (N,self.m))
-
-        if self.treatment_group:
-            data[:,-1] = np.squeeze(np.random.randint(0,2,(N,1)))
-            print(data[:,-1])
-
-        # Each patient has a uniform death probability
-        p_death = self.average_death * np.ones((N,1))
-
-        # Patients Hazard Model
-        # \lambda(t|X) = \lambda_0(t) exp(H(x))
-        #
-        # risk = True log hazard ratio
-        # log(\lambda(t|X) / \lambda_0(t)) = H(x)
-        if method == 'linear':
-            risk = self._linear_H(data)
-
-        elif method == 'gaussian':
-            risk = self._gaussian_H(data,**gaussian_config)
-
-        # Center the hazard ratio so population dies at the same rate
-        # independent of control group (makes the problem easier)
-        risk = risk - np.mean(risk)
-
-        # Generate time of death for each patient
-        # currently exponential random variable
-        death_time = np.zeros((N,1))
-        for i in range(N):
-            if self.treatment_group and data[i,-1] == 0:
-                death_time[i] = np.random.exponential(p_death[i])
-            else:
-                death_time[i] = np.random.exponential(p_death[i]) / exp(risk[i])
-
-        # If Censor_mode is 'observed_p': then find the end time in which observed_p percent of patients have an observed death
-        if self.censor_mode is 'observed_p':
-            if self.observed_p is None:
-                raise ValueError("Parameter observed_p must be porivded if censor_mode is configured to 'observed_p'")
-            end_time_idx = int(N * self.observed_p)
-            self.end_time = np.sort(death_time.flatten())[end_time_idx]
-
-        # Censor anything that is past end time
-        censoring = np.ones((N,1))
-        death_time[death_time > self.end_time] = self.end_time
-        censoring[death_time == self.end_time] = 0
-
-        # Flatten Arrays to Vectors
-        death_time = np.squeeze(death_time)
-        censoring = np.squeeze(censoring)
-
-        dataset = {
-            'x' : data.astype(np.float32),
-            'e' : censoring.astype(np.int32),
-            't' : death_time.astype(np.float32),
-            'hr' : risk.astype(np.float32)
-        }
-
-        return dataset
-
-def generate_data(treatment_group = False):
-    sd = SimulatedData(5, num_features = 2,
-        treatment_group = treatment_group)
-    train_data = sd.generate_data(6)
-    #valid_data = sd.generate_data(2000)
-    #test_data = sd.generate_data(2000)
-
-    return train_data
-
-def get_all_data_origin_sort(X_in, Y_in, E_in):
-    n, num_input = X_in.shape
-
-    # Sort by Y from low to high
-    sort_idx = np.argsort(Y_in, axis=0)
-    xdata = X_in[sort_idx].reshape(n, num_input)
-    ydata = Y_in[sort_idx].reshape(n, 1)
-    edata = E_in[sort_idx].reshape(n, 1)
-
-    return xdata, ydata, edata
-
-def get_all_data_origin_sort2(X_in, Y_in, E_in, G_in):
-    n, num_input = X_in.shape
-
-    # Sort by Y from low to high
-    sort_idx = np.argsort(Y_in, axis=0)
-    xdata = X_in[sort_idx].reshape(n, num_input)
-    ydata = Y_in[sort_idx].reshape(n, 1)
-    edata = E_in[sort_idx].reshape(n, 1)
-    gdata = G_in[sort_idx].reshape(n, 1)
-
-    return xdata, ydata, edata, gdata
-
-# Conditional inverse probability of censoring weights
-def conditional_ipcw (Y_in,treatment,E_in):
-    treated = Y_in[np.where(treatment == 1)[0]]
-    treated_cc = E_in[np.where(treatment == 1)[0]]
-    treated_data = pd.DataFrame({'event': treated_cc, 'time': treated})
-    treated_data = Surv.from_dataframe("event", "time", treated_data)
-
-    control = Y_in[np.where(treatment == 0)[0]]
-    control_cc = E_in[np.where(treatment == 0)[0]]
-    control_data = pd.DataFrame({'event': control_cc, 'time': control})
-    control_data = Surv.from_dataframe("event", "time", control_data)
-
-    treated_est = CensoringDistributionEstimator().fit(treated_data)
-    control_est = CensoringDistributionEstimator().fit(control_data)
-
-    treated_ipcw = treated_est.predict_ipcw(treated_data)
-    control_ipcw = control_est.predict_ipcw(control_data)
-
-    # reconstruct the conditional inverse probability of censoring weight vector
-    cipcw = np.ones([Y_in.shape[0], ])
-
-    cipcw[np.where(treatment == 1)[0]] = treated_ipcw
-    cipcw[np.where(treatment == 0)[0]] = control_ipcw
-
-    return cipcw
+def baseline_survival_function(y, pred_hr):
+    """
+    Estimate baseline survival function by Breslow Estimation.
+    Parameters
+    ----------
+    y : np.array
+        Observed time. Negtive values are considered right censored.
+    pred_hr : np.array
+        Predicted value, i.e. hazard ratio.
+    Returns
+    -------
+    DataFrame
+        Estimated baseline survival function. Index of it is time point.
+        The only one column of it is corresponding survival probability.
+    """
+    y = np.squeeze(y)
+    pred_hr = np.squeeze(pred_hr)
+    # unpack label
+    t = np.abs(y)
+    e = (y > 0).astype(np.int32)
+    return _baseline_survival_function(e, t, pred_hr)
